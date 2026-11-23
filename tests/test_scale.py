@@ -37,6 +37,7 @@ def measure(n):
     store.reset()
     rows = _build_rows(n, n // 2)
     store.import_rows(n, n // 2, rows)
+    index_rows = store.summary()["index_rows"]
     counter = _instrument(store)
     counter["statements"] = 0
 
@@ -60,6 +61,8 @@ def measure(n):
     store.close()
     return {
         "n": n,
+        "index_rows": index_rows,
+        "judged": len(rows),
         "query_statements": query_statements,
         "query_nodes": report["query_nodes"],
         "update_statements": update_statements,
@@ -75,8 +78,8 @@ def test_work_is_flat_between_1k_and_100k_bottles():
     small = measure(1_000)
     large = measure(TOTAL_BOTTLES)
     print("\nscale measurements:")
-    for key in ("query_statements", "query_nodes", "update_statements",
-                "update_nodes", "query_ms", "update_ms"):
+    for key in ("index_rows", "query_statements", "query_nodes",
+                "update_statements", "update_nodes", "query_ms", "update_ms"):
         print(f"  {key:>20}: {small[key]:>8.1f}  ->  {large[key]:>8.1f}")
     # 100x more bottles must not multiply the per-operation work; a small
     # allowance covers the deeper tree (10 vs 17 levels).
@@ -86,3 +89,12 @@ def test_work_is_flat_between_1k_and_100k_bottles():
     assert large["update_nodes"] < 200
     assert large["query_ms"] < 50
     assert large["update_ms"] < 50
+    # The index holds O(K log(N+1)) rows, K = judged samples: it grows with
+    # the sample count and the tree height, never with N alone.
+    for m in (small, large):
+        assert m["index_rows"] <= m["judged"] * 4 * m["height"]
+    # rows per judged sample stay flat (bounded by 4x the tree height)
+    assert large["index_rows"] / large["judged"] <= \
+        2 * small["index_rows"] / small["judged"]
+    # and it is nowhere near the old dense tree (2 * 2^ceil(log2(N+1)) - 1)
+    assert large["index_rows"] < (2 * tree_size(TOTAL_BOTTLES) - 1) // 10

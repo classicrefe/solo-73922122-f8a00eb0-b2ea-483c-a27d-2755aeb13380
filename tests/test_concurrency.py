@@ -74,16 +74,16 @@ def test_persisted_tree_equals_rebuild_after_parallel_writes(tmp_path):
     assert all(proc.exitcode == 0 for proc in procs)
 
     check = Store(path)
-    # Snapshot the incrementally maintained tree leaves (materialized).
+    # Snapshot the incrementally maintained sparse tree leaves (materialized).
     size = int(check._meta(check.conn.cursor())["seg_size"])
-    from app.store import TreeView
+    from app.store import SparseTreeView
 
     with check._tx(write=False) as cur:
-        view = TreeView(cur, N, size)
+        view = SparseTreeView(cur, N, size)
         minimum, count = view.all_min()
         leaves = []
         for cut in range(N + 1):
-            leaf = view._find_first(1, 0, size - 1, cut, cut, minimum, 0)
+            leaf = view.find_first(minimum, cut, cut)
             leaves.append(leaf)
     assert count == sum(1 for cut in leaves if cut >= 0)
     # Rebuild a fresh store and compare candidate summaries, which is the

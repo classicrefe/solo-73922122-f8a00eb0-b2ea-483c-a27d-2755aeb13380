@@ -23,13 +23,27 @@ recipe/label"):
   not certain ones are ``(min C, max C]``.  Only two segments are ever needed,
   so reporting is O(log N) plus O(1) output.
 
+The conflict function is maintained in two interchangeable segment-tree
+flavours:
+
+* :class:`MinCountTree` -- the classic dense in-memory tree (reference and
+  test oracle), and
+* :class:`SparseTree` plus the ``sparse_*`` helpers -- a refcounted sparse
+  tree where a node is stored only while at least one active judged sample's
+  range-add visits it.  One judged sample touches O(log N) nodes, so the
+  stored index holds O(1 + K log(N+1)) rows for K judged samples, and
+  reverting a sample to ``pending`` reclaims exactly its rows.  The same
+  generic helpers drive both the in-memory dict backend (bulk rebuilds,
+  tests) and the SQLite backend in :mod:`app.store`, so the two cannot
+  diverge.
+
 Everything in this module is independent of Flask/SQLite so it can be tested
 directly.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, Mapping, Optional
+from typing import Dict, Iterable, Mapping, Optional, Tuple
 
 INF = 1 << 30
 
@@ -170,6 +184,225 @@ class MinCountTree:
         if found != -1:
             return found
         return self._find_last(i * 2, node_lo, mid, lo, hi, target)
+
+
+# ---------------------------------------------------------------------------
+# Sparse refcounted segment tree (compressed index)
+# ---------------------------------------------------------------------------
+# A node of the cut tree over 0..N is stored only while it is "active":
+# at least one judged (old/new) sample's range-add visits it.  The visit set
+# of a range-add is deterministic (it depends only on the range and the tree
+# shape) and ancestor-closed, so
+#
+# * rows stored <= K * (nodes visited by one range-add) = O(K log(N+1))
+#   where K counts only old/new samples, and
+# * replaying the same range with the opposite delta visits exactly the same
+#   nodes, which lets a per-node refcount drive precise reclamation when a
+#   sample is withdrawn (reverted to "pending").
+#
+# Stored invariant per node row: ``mn``/``cnt`` describe the subtree minimum
+# *including* this node's own ``self_add`` but *excluding* the ``self_add``
+# of its ancestors; readers accumulate ancestor ``self_add`` while descending
+# (classic lazy propagation, except nothing is ever pushed down, which is
+# what keeps the visit set deterministic and the refcounting exact).
+
+def tree_size(n_bottles: int) -> int:
+    """Leaf count (power of two) of the cut tree over cuts 0..N."""
+    size = 1
+    while size < n_bottles + 1:
+        size <<= 1
+    return size
+
+
+def node_default(nl: int, nr: int, n: int) -> Tuple[int, int]:
+    """(mn, cnt) of a node covering cuts [nl, nr] that has no stored row.
+
+    Inside ``0..N`` the conflict function defaults to 0 (no judged sample
+    constrains those cuts); padding cuts beyond N stay INF so they can never
+    be mistaken for an admissible cut.
+    """
+    if nl > n:
+        return INF, 0
+    return 0, min(nr, n) - nl + 1
+
+
+def sparse_range_add(get, put, delete, total_bottles: int, size: int,
+                     lo: int, hi: int, delta: int) -> Tuple[int, int]:
+    """Add ``delta`` (±1) to the conflict function over cuts [lo, hi].
+
+    ``get``/``put``/``delete`` are the node-store backend:
+    ``get(idx) -> (mn, cnt, self_add, ref) | None``,
+    ``put(idx, mn, cnt, self_add, ref)``, ``delete(idx)``.
+
+    Returns ``(visited_nodes, index_rows_delta)``.  Runs in O(log N) node
+    visits regardless of how many samples are stored.
+    """
+    if delta == 0:
+        return 0, 0
+    lo = max(lo, 0)
+    hi = min(hi, total_bottles)
+    if lo > hi:
+        return 0, 0
+    return _sparse_add(get, put, delete, total_bottles, 1, 0, size - 1,
+                       lo, hi, delta)
+
+
+def _sparse_add(get, put, delete, n, idx, nl, nr, lo, hi, delta):
+    if nr < lo or nl > hi or nl > n:
+        return 0, 0
+    row = get(idx)
+    if row is None:
+        mn, cnt = node_default(nl, nr, n)
+        self_add = 0
+        ref = 0
+        existed = False
+    else:
+        mn, cnt, self_add, ref = row
+        existed = True
+    visits = 1
+    rows_delta = 0
+    if lo <= nl and nr <= hi:
+        mn += delta
+        self_add += delta
+    else:
+        mid = (nl + nr) // 2
+        left = idx * 2
+        right = left + 1
+        v, d = _sparse_add(get, put, delete, n, left, nl, mid, lo, hi, delta)
+        visits += v
+        rows_delta += d
+        v, d = _sparse_add(get, put, delete, n, right, mid + 1, nr, lo, hi, delta)
+        visits += v
+        rows_delta += d
+        lrow = get(left)
+        lmn, lcnt = (lrow[0], lrow[1]) if lrow else node_default(nl, mid, n)
+        rrow = get(right)
+        rmn, rcnt = (rrow[0], rrow[1]) if rrow else node_default(mid + 1, nr, n)
+        if lmn < rmn:
+            mn, cnt = self_add + lmn, lcnt
+        elif rmn < lmn:
+            mn, cnt = self_add + rmn, rcnt
+        else:
+            mn, cnt = self_add + lmn, lcnt + rcnt
+    ref += 1 if delta > 0 else -1
+    if ref <= 0:
+        # No active sample visits this node any more; because visit sets are
+        # ancestor-closed, no descendant row can exist either, so dropping
+        # the row reverts the whole subtree to the default.
+        if existed:
+            delete(idx)
+            rows_delta -= 1
+    else:
+        put(idx, mn, cnt, self_add, ref)
+        if not existed:
+            rows_delta += 1
+    return visits, rows_delta
+
+
+def sparse_all_min(get, total_bottles: int, size: int) -> Tuple[int, int]:
+    row = get(1)
+    if row is None:
+        return node_default(0, size - 1, total_bottles)
+    return row[0], row[1]
+
+
+def sparse_find_first(get, total_bottles: int, size: int, target: int,
+                      lo: int, hi: int) -> int:
+    lo = max(lo, 0)
+    hi = min(hi, total_bottles)
+    if lo > hi:
+        return -1
+    return _sparse_find(get, total_bottles, 1, 0, size - 1, lo, hi, target, 0, True)
+
+
+def sparse_find_last(get, total_bottles: int, size: int, target: int,
+                     lo: int, hi: int) -> int:
+    lo = max(lo, 0)
+    hi = min(hi, total_bottles)
+    if lo > hi:
+        return -1
+    return _sparse_find(get, total_bottles, 1, 0, size - 1, lo, hi, target, 0, False)
+
+
+def _sparse_find(get, n, idx, nl, nr, ql, qr, target, acc, first):
+    if nr < ql or nl > qr or nl > n:
+        return -1
+    row = get(idx)
+    if row is None:
+        mn, cnt = node_default(nl, nr, n)
+        self_add = 0
+    else:
+        mn, cnt, self_add = row[0], row[1], row[2]
+    if cnt == 0 or mn + acc != target:
+        return -1
+    if nl == nr:
+        return nl
+    mid = (nl + nr) // 2
+    near = (idx * 2, nl, mid) if first else (idx * 2 + 1, mid + 1, nr)
+    far = (idx * 2 + 1, mid + 1, nr) if first else (idx * 2, nl, mid)
+    found = _sparse_find(get, n, near[0], near[1], near[2], ql, qr, target,
+                         acc + self_add, first)
+    if found != -1:
+        return found
+    return _sparse_find(get, n, far[0], far[1], far[2], ql, qr, target,
+                        acc + self_add, first)
+
+
+class SparseTree:
+    """In-memory dict-backed sparse refcounted min-count segment tree.
+
+    Used for bulk (re)builds at import/migration time and as the exact
+    reference for the SQLite-backed store in tests: the rows of the SQL
+    index must equal ``nodes`` of this tree after the same operations.
+    """
+
+    __slots__ = ("n", "size", "nodes")
+
+    def __init__(self, total_bottles: int):
+        self.n = total_bottles
+        self.size = tree_size(total_bottles)
+        self.nodes: Dict[int, list] = {}  # idx -> [mn, cnt, self_add, ref]
+
+    @classmethod
+    def build(cls, total_bottles: int, verdicts: Mapping[int, str]) -> "SparseTree":
+        tree = cls(total_bottles)
+        for bottle, verdict in verdicts.items():
+            tree.apply(bottle, verdict, +1)
+        return tree
+
+    def apply(self, bottle: int, verdict: str, delta: int) -> Tuple[int, int]:
+        """Insert/remove one sample's contribution in O(log N)."""
+        if verdict == OLD:
+            return self._add(0, bottle - 1, delta)
+        if verdict == NEW:
+            return self._add(bottle, self.n, delta)
+        return 0, 0
+
+    def _add(self, lo: int, hi: int, delta: int) -> Tuple[int, int]:
+        nodes = self.nodes
+        return sparse_range_add(
+            nodes.get,
+            lambda idx, mn, cnt, self_add, ref: nodes.__setitem__(
+                idx, [mn, cnt, self_add, ref]),
+            lambda idx: nodes.pop(idx, None),
+            self.n, self.size, lo, hi, delta,
+        )
+
+    @property
+    def rows(self) -> int:
+        return len(self.nodes)
+
+    # -- query facade (same shape as MinCountTree / the SQL view) ----------
+    def all_min(self) -> Tuple[int, int]:
+        return sparse_all_min(self.nodes.get, self.n, self.size)
+
+    def find_first(self, target: int, lo: int = 0, hi: Optional[int] = None) -> int:
+        hi = self.n if hi is None else hi
+        return sparse_find_first(self.nodes.get, self.n, self.size, target, lo, hi)
+
+    def find_last(self, target: int, lo: int = 0, hi: Optional[int] = None) -> int:
+        hi = self.n if hi is None else hi
+        return sparse_find_last(self.nodes.get, self.n, self.size, target, lo, hi)
 
 
 # ---------------------------------------------------------------------------

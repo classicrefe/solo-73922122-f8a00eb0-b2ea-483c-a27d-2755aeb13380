@@ -101,13 +101,16 @@ def test_write_failure_rolls_back_tree_and_samples(store):
     n = 200
     store.import_rows(n, 100, [(50, OLD), (150, NEW)])
     committed = store.summary()
-    # Force the tree update to fail mid-transaction by making the seg table
-    # read-only for the duration of the call.
-    store.conn.execute("CREATE TRIGGER fail_seg BEFORE UPDATE ON seg "
+    # Force the index update to fail mid-transaction by making the seg2
+    # table read-only for the duration of the call.
+    store.conn.execute("CREATE TRIGGER fail_seg_ins BEFORE INSERT ON seg2 "
+                       "BEGIN SELECT RAISE(ABORT, 'injected'); END")
+    store.conn.execute("CREATE TRIGGER fail_seg_upd BEFORE UPDATE ON seg2 "
                        "BEGIN SELECT RAISE(ABORT, 'injected'); END")
     with pytest.raises(sqlite3.DatabaseError):
         store.set_verdict(60, NEW)
-    store.conn.execute("DROP TRIGGER fail_seg")
+    store.conn.execute("DROP TRIGGER fail_seg_ins")
+    store.conn.execute("DROP TRIGGER fail_seg_upd")
     assert store.summary() == committed
     assert store.get_sample(60) is None
 
@@ -146,6 +149,12 @@ def test_100k_single_update_and_query_are_sublinear(store):
     assert report["query_nodes"] < 400
     assert report["must"] is None
     assert report["bounds"]["min"] == 0
+    # the compressed index holds O(K log N) rows, not O(N): K = 325 judged
+    judged = sum(1 for _, v in rows if v != PENDING)
+    height = tree_size(n).bit_length()
+    assert report["index_rows"] <= judged * 4 * height
+    assert report["index_rows"] < report["legacy_index_rows"] // 10
+    assert report["legacy_index_rows"] == 2 * tree_size(n) - 1 == 262_143
     info = store.set_verdict(58_800, OLD)
     assert info["changed"] is True
     assert info["update_nodes"] < 200
@@ -155,3 +164,82 @@ def test_100k_single_update_and_query_are_sublinear(store):
     assert after["must"] == {"start": 58_721, "end": 58_800, "count": 80}
     assert after["partial"] == {"start": 58_801, "end": 58_887, "count": 87}
     assert after["bounds"] == {"min": 80, "max": 167}
+
+
+def test_pending_revert_reclaims_exact_index_rows(store):
+    n = 100_000
+    rows = [(b, OLD if b <= 58_400 else NEW) for b in range(251, n + 1, 307)]
+    store.import_rows(n, 58_720, rows)
+    before = store.summary()["index_rows"]
+    info = store.set_verdict(58_800, OLD)
+    assert info["index_rows_delta"] > 0
+    mid = store.summary()["index_rows"]
+    assert mid == before + info["index_rows_delta"]
+    # reverting to pending reclaims exactly the extra rows
+    undo = store.set_verdict(58_800, PENDING)
+    assert undo["index_rows_delta"] == -info["index_rows_delta"]
+    assert store.summary()["index_rows"] == before
+    # ... while the pending detail stays queryable
+    assert store.get_sample(58_800)["verdict"] == PENDING
+    # and withdrawing every judgement empties the index entirely
+    for bottle, _ in rows:
+        store.set_verdict(bottle, PENDING)
+    assert store.summary()["index_rows"] == 0
+    assert store.conn.execute("SELECT COUNT(*) FROM seg2").fetchone()[0] == 0
+    # pending details are still all there (the imported rows plus #58800)
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM samples WHERE verdict = 'pending'").fetchone()[0] == len(rows) + 1
+
+
+def test_sql_index_matches_inmemory_sparse_tree(store):
+    """The SQL backend and the dict backend must produce identical rows."""
+    n = 500
+    rows = [(b, OLD if b <= 250 else NEW) for b in range(1, n + 1, 10)]
+    store.import_rows(n, 240, rows)
+    rng = random.Random(23)
+    for _ in range(80):
+        store.set_verdict(rng.randint(1, n), rng.choice([OLD, NEW, PENDING]))
+    got = {
+        row[0]: tuple(row[1:])
+        for row in store.conn.execute(
+            "SELECT idx, mn, cnt, self_add, ref FROM seg2")
+    }
+    verdicts = {
+        row[0]: row[1]
+        for row in store.conn.execute("SELECT bottle, verdict FROM samples")
+    }
+    reference = algorithm.SparseTree.build(n, verdicts)
+    want = {idx: tuple(vals) for idx, vals in reference.nodes.items()}
+    assert got == want
+    assert store.summary()["index_rows"] == len(want) == \
+        store.conn.execute("SELECT COUNT(*) FROM seg2").fetchone()[0]
+
+
+def test_restart_reuses_persisted_index_without_rebuild(tmp_path, monkeypatch):
+    path = str(tmp_path / "restart.sqlite3")
+    n = 1000
+    rows = [(b, OLD if b <= 400 else NEW) for b in range(1, n + 1, 7)]
+    first = Store(path)
+    first.import_rows(n, 450, rows)
+    first.set_verdict(900, OLD)
+    before = first.summary()
+    first.close()
+
+    import app.store as store_module
+
+    calls = []
+    real_rebuild = store_module.rebuild_index
+
+    def spy(cur, n_, verdicts):
+        calls.append(1)
+        return real_rebuild(cur, n_, verdicts)
+
+    monkeypatch.setattr(store_module, "rebuild_index", spy)
+    second = Store(path)
+    after = second.summary()
+    # a normal restart must not rebuild or otherwise rewrite the index
+    assert calls == []
+    assert after["index_rows"] == before["index_rows"]
+    assert after["candidates"] == before["candidates"]
+    assert after["query_nodes"] <= before["query_nodes"] + 2
+    second.close()

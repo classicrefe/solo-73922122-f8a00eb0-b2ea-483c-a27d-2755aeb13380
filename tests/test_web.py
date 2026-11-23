@@ -52,6 +52,7 @@ def test_demo_import_and_summary(client):
 def test_single_edit_changes_relabel_range(client):
     upload(client, demo_csv())
     before = client.get("/api/summary").get_json()["summary"]
+    assert before["index_rows"] < before["legacy_index_rows"] // 10
     response = client.post(
         "/api/sample", json={"bottle": 58_800, "verdict": "old"}
     )
@@ -69,6 +70,11 @@ def test_single_edit_changes_relabel_range(client):
     assert restored["must"] == before["must"]
     assert restored["partial"] == before["partial"]
     assert restored["bounds"] == before["bounds"]
+    # and the extra index rows are reclaimed, while the pending sample
+    # detail stays queryable
+    assert restored["index_rows"] == before["index_rows"]
+    sample = client.get("/api/sample/58800").get_json()["sample"]
+    assert sample["verdict"] == "pending"
 
 
 def test_label_correction_changes_report(client):

@@ -85,3 +85,54 @@ def test_conflicting_samples_produce_honest_tie():
     assert slow["partial"] == {"start": 9, "end": 10, "count": 2}
     assert slow["bounds"] == {"min": 3, "max": 5}
     assert slow["counts"] == {"must": 3, "partial": 2, "union": 5}
+
+
+def test_sparse_tree_matches_brute_force_and_dense_tree():
+    rng = random.Random(20261123)
+    for _ in range(150):
+        n, verdicts, label = random_case(rng)
+        sparse = algorithm.SparseTree.build(n, verdicts)
+        dense = algorithm.build_tree(n, verdicts)
+        slow = algorithm.brute_force(n, verdicts, label)
+        fast = algorithm.summarize(sparse, n, label)
+        assert fast == algorithm.summarize(dense, n, label)
+        for key in ("candidates", "must", "partial", "bounds", "counts"):
+            assert fast[key] == slow[key], (n, verdicts, label, key)
+        # the sparse index is bounded by K * O(log N), K = judged samples
+        judged = sum(1 for v in verdicts.values() if v != PENDING)
+        height = sparse.size.bit_length()
+        assert sparse.rows <= max(1, judged * 4 * height)
+
+
+def test_sparse_tree_incremental_updates_and_reclamation():
+    rng = random.Random(4242)
+    for _ in range(120):
+        n, verdicts, label = random_case(rng)
+        sparse = algorithm.SparseTree.build(n, verdicts)
+        current = dict(verdicts)
+        for _step in range(25):
+            bottle = rng.randint(1, n)
+            new_verdict = rng.choice([OLD, NEW, PENDING])
+            previous = current.get(bottle)
+            if previous is not None:
+                sparse.apply(bottle, previous, -1)
+            if new_verdict != PENDING:
+                sparse.apply(bottle, new_verdict, +1)
+            if new_verdict == PENDING:
+                current.pop(bottle, None)
+            else:
+                current[bottle] = new_verdict
+            label = rng.randint(0, n)
+            fast = algorithm.summarize(sparse, n, label)
+            slow = algorithm.brute_force(n, current, label)
+            for key in ("candidates", "must", "partial", "bounds", "counts"):
+                assert fast[key] == slow[key], (n, current, label, key)
+            # incremental state must equal a from-scratch build, row for row
+            rebuilt = algorithm.SparseTree.build(n, current)
+            assert sparse.nodes == rebuilt.nodes
+        # withdrawing every judgement reclaims all index rows
+        for bottle, verdict in list(current.items()):
+            sparse.apply(bottle, verdict, -1)
+        assert sparse.rows == 0
+        mn, cnt = sparse.all_min()
+        assert (mn, cnt) == (0, n + 1)

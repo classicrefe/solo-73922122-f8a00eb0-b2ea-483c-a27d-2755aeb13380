@@ -158,9 +158,15 @@ function renderViz(summary) {
 function renderOps(summary) {
   const host = $("ops");
   const s = summary.state;
+  const rows = summary.index_rows;
+  const legacy = summary.legacy_index_rows;
   host.innerHTML =
     `<div><dt>已提交版本</dt><dd>v${fmt(summary.version)}</dd></div>` +
     `<div><dt>最近写入</dt><dd>${s.updated_at || "–"}</dd></div>` +
+    (rows !== undefined
+      ? `<div><dt>压缩索引行数</dt><dd>${fmt(rows)}` +
+        (legacy ? `（旧式全量需 ${fmt(legacy)} 行）` : "") + `</dd></div>`
+      : "") +
     `<div><dt>查询读取树节点</dt><dd>${fmt(summary.query_nodes)}</dd></div>` +
     `<div><dt>候选切点查询</dt><dd>O(log N)</dd></div>` +
     `<div><dt>单瓶补改</dt><dd>O(log N)</dd></div>`;
@@ -270,8 +276,10 @@ $("apply-verdict").addEventListener("click", async () => {
     });
     applySummary(payload.summary);
     const u = payload.update;
+    const d = u.index_rows_delta || 0;
+    const rowsNote = d > 0 ? `索引 +${fmt(d)} 行` : d < 0 ? `索引回收 ${fmt(-d)} 行` : "索引行数不变";
     $("edit-hint").textContent = u.changed
-      ? `#${bottle}：${u.previous || "无记录"} → ${verdict}；增量更新 ${u.update_nodes} 个树节点，报告已按 v${u.version} 重算。`
+      ? `#${bottle}：${u.previous || "无记录"} → ${verdict}；增量更新 ${u.update_nodes} 个树节点（${rowsNote}），报告已按 v${u.version} 重算。`
       : `#${bottle} 原本就是 ${verdict}，未改动。`;
     renderDiff(before, payload.summary);
     toast("补改已提交");
