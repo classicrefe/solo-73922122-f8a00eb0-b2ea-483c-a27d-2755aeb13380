@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>涂料灌装 · 换配方重贴标签核对</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">◧</span>
+    <div>
+      <h1>涂料灌装 · 重贴标签核对</h1>
+      <p class="sub">按瓶号核对旧/新配方与旧/新标签的切点，找出必须重贴与可能重贴的号段</p>
+    </div>
+  </div>
+  <div class="status" id="status-pill">未导入</div>
+</header>
+
+<main>
+  <section class="card" id="import-card">
+    <h2>1 · 导入一班复核 CSV</h2>
+    <form id="import-form">
+      <div class="grid">
+        <label class="field">
+          <span>留样 CSV（bottle,verdict）</span>
+          <input type="file" id="csv-file" accept=".csv,text/csv">
+        </label>
+        <label class="field">
+          <span>总瓶数（1–100000）</span>
+          <input type="number" id="total-bottles" min="1" max="100000" required
+                 placeholder="例如 100000">
+        </label>
+        <label class="field">
+          <span>最后一瓶旧标签编号（换标号）</span>
+          <input type="number" id="label-cut" min="0" max="100000"
+                 placeholder="例如 60000，可留空稍后补录">
+        </label>
+      </div>
+      <div class="row">
+        <button type="submit" class="primary" id="import-btn">导入并核对</button>
+        <button type="button" id="demo-btn" class="ghost">载入演示数据</button>
+        <button type="button" id="reset-btn" class="ghost danger">清空</button>
+        <span class="hint">CSV 表头 <code>bottle,verdict</code>，verdict 支持
+          <code>old/new/pending</code> 或 <code>旧/新/待核</code>。</span>
+      </div>
+    </form>
+    <p class="error" id="import-error" hidden></p>
+  </section>
+
+  <section class="card" id="report-card" hidden>
+    <div class="card-head">
+      <h2>2 · 核对结果</h2>
+      <div class="meta" id="report-meta"></div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><span class="k">最少冲突留样</span><b id="stat-conflicts">–</b></div>
+      <div class="stat"><span class="k">并列最优配方切点</span><b id="stat-cuts">–</b></div>
+      <div class="stat"><span class="k">必错瓶数</span><b id="stat-must">–</b></div>
+      <div class="stat"><span class="k">仅部分切点下错标</span><b id="stat-partial">–</b></div>
+      <div class="stat wide"><span class="k">错标瓶数精确上下界</span><b id="stat-bounds">–</b></div>
+    </div>
+
+    <div class="viz-wrap">
+      <div class="viz-legend">
+        <span><i class="sw must"></i>必错号段</span>
+        <span><i class="sw partial"></i>仅部分切点下错标</span>
+        <span><i class="sw label"></i>换标号</span>
+        <span><i class="sw cand"></i>候选配方切点</span>
+      </div>
+      <div class="viz" id="viz">
+        <div class="axis"><span id="axis-0">0</span><span id="axis-n"></span></div>
+        <div class="track" id="track">
+          <div class="seg must" id="seg-must" hidden></div>
+          <div class="seg partial" id="seg-partial" hidden></div>
+          <div class="marker label" id="mk-label" hidden><span></span></div>
+          <div class="marker cand" id="mk-cand" hidden><span></span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="segments">
+      <div class="seg-box must">
+        <h3>必错号段</h3>
+        <div id="must-list" class="seg-list"></div>
+      </div>
+      <div class="seg-box partial">
+        <h3>仅在部分切点下错标</h3>
+        <div id="partial-list" class="seg-list"></div>
+      </div>
+    </div>
+
+    <details class="candidates">
+      <summary>候选配方切点明细</summary>
+      <p id="cand-line"></p>
+    </details>
+  </section>
+
+  <section class="card" id="edit-card" hidden>
+    <h2>3 · 单瓶补改与换标号更正</h2>
+    <div class="grid">
+      <label class="field">
+        <span>瓶号</span>
+        <input type="number" id="edit-bottle" min="1" placeholder="留样瓶号">
+      </label>
+      <label class="field">
+        <span>该瓶留样判定</span>
+        <select id="edit-verdict">
+          <option value="old">旧配方（old）</option>
+          <option value="new">新配方（new）</option>
+          <option value="pending">待核（pending）</option>
+        </select>
+      </label>
+      <div class="field">
+        <span>&nbsp;</span>
+        <button class="primary" id="apply-verdict">提交补改</button>
+      </div>
+      <label class="field">
+        <span>更正最后一瓶旧标签编号</span>
+        <input type="number" id="edit-label" min="0" placeholder="换标号">
+      </label>
+      <div class="field">
+        <span>&nbsp;</span>
+        <button class="primary" id="apply-label">更正换标号</button>
+      </div>
+    </div>
+    <p class="hint" id="edit-hint">补改只改动一个留样，并增量更新冲突函数；报告随最新已提交状态重算。</p>
+    <p class="error" id="edit-error" hidden></p>
+    <div class="diff" id="diff" hidden>
+      <h3>补改前后对比</h3>
+      <div class="diff-grid">
+        <div class="diff-col"><h4>补改前</h4><div id="diff-before"></div></div>
+        <div class="diff-arrow">→</div>
+        <div class="diff-col"><h4>补改后</h4><div id="diff-after"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" id="ops-card" hidden>
+    <h2>性能与状态</h2>
+    <dl class="ops" id="ops"></dl>
+  </section>
+</main>
+
+<div class="toast" id="toast" hidden></div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
